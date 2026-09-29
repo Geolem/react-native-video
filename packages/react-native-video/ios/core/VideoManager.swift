@@ -1,0 +1,530 @@
+//
+//  VideoManager.swift
+//  ReactNativeVideo
+//
+//  Created by Krzysztof Moch on 27/04/2025.
+//
+
+import Foundation
+import AVFoundation
+
+class VideoManager {
+  // MARK: - Singleton
+  static let shared = VideoManager()
+  
+  private let players = NSHashTable<HybridVideoPlayer>.weakObjects()
+  private let videoView = NSHashTable<VideoComponentView>.weakObjects()
+  
+  private var isAudioSessionActive = false
+  private var remoteControlEventsActive = false
+
+  /// Global flag to force disable audio session management
+  private var isAudioSessionManagementForcedDisabled: Bool = false
+
+  /// Returns true if audio session management is disabled either globally or by any player
+  private var isAudioSessionManagementDisabled: Bool {
+    if isAudioSessionManagementForcedDisabled {
+      return true
+    }
+
+    // Check if any player has audio session management disabled
+    return players.allObjects.contains { player in
+      player.disableAudioSessionManagement
+    }
+  }
+
+  func setAudioSessionManagementDisabled(_ disabled: Bool) {
+    runOnMainThreadSync { [weak self] in
+      guard let self else { return }
+      self.isAudioSessionManagementForcedDisabled = disabled
+
+      if disabled {
+        // Deactivate audio session when disabling management
+        // so other libraries can take control
+        self.deactivateAudioSession()
+      } else {
+        // Re-enable audio session management
+        self.updateAudioSessionConfiguration()
+      }
+    }
+  }
+  
+  private init() {
+    // Subscribe to audio interruption notifications
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAudioSessionInterruption),
+      name: AVAudioSession.interruptionNotification,
+      object: nil
+    )
+    
+    // Subscribe to route change notifications
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAudioRouteChange),
+      name: AVAudioSession.routeChangeNotification,
+      object: nil
+    )
+    
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(applicationWillResignActive(notification:)),
+      name: UIApplication.willResignActiveNotification,
+      object: nil
+    )
+    
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(applicationDidBecomeActive(notification:)),
+      name: UIApplication.didBecomeActiveNotification,
+      object: nil
+    )
+    
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(applicationDidEnterBackground(notification:)),
+      name: UIApplication.didEnterBackgroundNotification,
+      object: nil
+    )
+    
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(applicationWillEnterForeground(notification:)),
+      name: UIApplication.willEnterForegroundNotification,
+      object: nil
+    )
+  }
+  
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+  }
+  
+  // MARK: - public
+  
+  func register(player: HybridVideoPlayer) {
+    runOnMainThread { [player] in
+      self.players.add(player)
+      PluginsRegistry.shared.notifyPlayerCreated(player: player)
+    }
+  }
+  
+  func unregister(player: HybridVideoPlayer) {
+    guard !Thread.isMainThread else {
+      // Weak table membership is already cleared during deinit, after release is claimed.
+      guard players.contains(player) || player.isReleased else { return }
+      unregisterOnMainThread(player: player)
+      return
+    }
+
+    deferUnregisterToMainThread(player: player)
+  }
+
+  private func deferUnregisterToMainThread(player: HybridVideoPlayer) {
+    runOnMainThread { [weak player] in
+      guard let player, self.players.contains(player) else { return }
+      self.unregisterOnMainThread(player: player)
+    }
+  }
+
+  private func unregisterOnMainThread(player: HybridVideoPlayer) {
+    players.remove(player)
+    withExtendedLifetime(player) {
+      PluginsRegistry.shared.notifyPlayerDestroyed(player: player)
+    }
+  }
+  
+  func register(view: VideoComponentView) {
+    runOnMainThread { [weak view] in
+      guard let view else { return }
+      self.videoView.add(view)
+    }
+  }
+  
+  func unregister(view: VideoComponentView) {
+    runOnMainThreadSync {
+      videoView.remove(view)
+    }
+  }
+  
+  func requestAudioSessionUpdate() {
+    runOnMainThread { [weak self] in
+      self?.updateAudioSessionConfiguration()
+    }
+  }
+
+  /// Clears the resume intent for the player backing `avPlayer` — for remote
+  /// (lock screen / Control Center / headset) pauses, which bypass `pause()`.
+  func clearBackgroundResumeIntent(for avPlayer: AVPlayer) {
+    runOnMainThread { [weak self, weak avPlayer] in
+      guard let self, let avPlayer else { return }
+      for player in self.players.allObjects where player.player === avPlayer {
+        player.wasPlayingInBackground = false
+      }
+    }
+  }
+
+  // MARK: - Remote Control Events
+  func setRemoteControlEventsActive(_ active: Bool) {
+    runOnMainThread { [weak self] in
+      guard let self,
+            !self.isAudioSessionManagementDisabled,
+            self.remoteControlEventsActive != active else { return }
+
+      self.remoteControlEventsActive = active
+      self.updateAudioSessionConfiguration()
+    }
+  }
+  
+  // MARK: - Audio Session Management
+  private func activateAudioSession() {
+    // No early-return: there's no public `isActive` getter, so the cached flag goes stale
+    // when the system deactivates the session (e.g. while suspended). setActive(true) is idempotent.
+    do {
+      try AVAudioSession.sharedInstance().setActive(true)
+      isAudioSessionActive = true
+    } catch {
+      print("Failed to activate audio session: \(error.localizedDescription)")
+    }
+  }
+
+  private func deactivateAudioSession() {
+    if !isAudioSessionActive {
+      return
+    }
+
+    do {
+      try AVAudioSession.sharedInstance().setActive(
+        false, options: .notifyOthersOnDeactivation
+      )
+      isAudioSessionActive = false
+    } catch {
+      print("Failed to deactivate audio session: \(error.localizedDescription)")
+    }
+  }
+
+  private func updateAudioSessionConfiguration() {
+    if isAudioSessionManagementDisabled {
+      return
+    }
+
+    let isAnyPlayerPlaying = players.allObjects.contains { hybridPlayer in
+      hybridPlayer.player.isMuted == false && hybridPlayer.player.rate != 0
+    }
+    
+    let anyPlayerNeedsNotMixWithOthers = players.allObjects.contains { player in
+      player.mixAudioMode == .donotmix
+    }
+    
+    let anyPlayerNeedsNotificationControls = players.allObjects.contains { player in
+      player.showNotificationControls
+    }
+    
+    if isAnyPlayerPlaying || anyPlayerNeedsNotMixWithOthers || anyPlayerNeedsNotificationControls || remoteControlEventsActive {
+      activateAudioSession()
+    } else {
+      deactivateAudioSession()
+    }
+    
+    configureAudioSession()
+  }
+
+  private func configureAudioSession() {
+    let audioSession = AVAudioSession.sharedInstance()
+    var audioSessionCategoryOptions: AVAudioSession.CategoryOptions = audioSession.categoryOptions
+    
+    let anyViewNeedsPictureInPicture = videoView.allObjects.contains { view in
+      view.allowsPictureInPicturePlayback
+    }
+    
+    let anyPlayerNeedsSilentSwitchObey = players.allObjects.contains { player in
+      player.ignoreSilentSwitchMode == .obey
+    }
+    
+    let anyPlayerNeedsSilentSwitchIgnore = players.allObjects.contains { player in
+      player.ignoreSilentSwitchMode == .ignore
+    }
+
+    let anyPlayerNeedsBackgroundPlayback = players.allObjects.contains { player in
+      player.playInBackground
+    }
+    
+    let anyPlayerNeedsNotificationControls = players.allObjects.contains { player in
+      player.showNotificationControls
+    }
+    
+    let category: AVAudioSession.Category = determineAudioCategory(
+      silentSwitchObey: anyPlayerNeedsSilentSwitchObey,
+      silentSwitchIgnore: anyPlayerNeedsSilentSwitchIgnore,
+      earpiece: false, // TODO: Pass actual value after we add prop
+      pip: anyViewNeedsPictureInPicture,
+      backgroundPlayback: anyPlayerNeedsBackgroundPlayback,
+      notificationControls: anyPlayerNeedsNotificationControls
+    )
+    
+    let audioMixingMode = determineAudioMixingMode()
+
+  
+    audioSessionCategoryOptions.remove(.duckOthers)
+    audioSessionCategoryOptions.remove(.mixWithOthers)
+
+    switch audioMixingMode {
+    case .mixwithothers:
+      audioSessionCategoryOptions.insert(.mixWithOthers)
+    case .duckothers:
+      audioSessionCategoryOptions.insert(.duckOthers)
+    case .auto, .donotmix:
+      // Do nothing as we already cleared the options
+      break
+    }
+    
+    // setCategory is a relatively expensive IPC and this runs on every audio-session refresh —
+    // skip it when nothing changed (category/mode/options are readable, unlike the active state).
+    if audioSession.category == category
+      && audioSession.mode == .moviePlayback
+      && audioSession.categoryOptions == audioSessionCategoryOptions {
+      return
+    }
+
+    do {
+      try audioSession.setCategory(category, mode: .moviePlayback, options: audioSessionCategoryOptions)
+    } catch {
+      print("ReactNativeVideo: Failed to set audio session category: \(error.localizedDescription)")
+    }
+  }
+  
+  private func determineAudioCategory(
+    silentSwitchObey: Bool,
+    silentSwitchIgnore: Bool,
+    earpiece: Bool,
+    pip: Bool,
+    backgroundPlayback: Bool,
+    notificationControls: Bool
+  ) -> AVAudioSession.Category {
+    // Handle conflicting settings
+    if silentSwitchObey && silentSwitchIgnore {
+      print(
+        "Warning: Conflicting ignoreSilentSwitch settings found (obey vs ignore) - defaulting to ignore"
+      )
+      return .playback
+    }
+    
+    // PiP, background playback, or notification controls require playback category
+    if pip || backgroundPlayback || notificationControls || remoteControlEventsActive {
+      if silentSwitchObey {
+        print(
+          "Warning: ignoreSilentSwitch=obey cannot be used with PiP, backgroundPlayback, or notification controls - using playback category"
+        )
+      }
+      
+      if earpiece {
+        print(
+          "Warning: audioOutput=earpiece cannot be used with PiP, backgroundPlayback, or notification controls - using playback category"
+        )
+      }
+      
+      // Set up background playback policy if needed
+      if backgroundPlayback {
+        players.allObjects.forEach { player in
+          if player.playInBackground {
+            player.player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+          } else {
+            player.player.audiovisualBackgroundPlaybackPolicy = .pauses
+          }
+        }
+      }
+      
+      return .playback
+    }
+    
+    // Earpiece requires playAndRecord
+    if earpiece {
+      if silentSwitchObey {
+        print(
+          "Warning: audioOutput=earpiece cannot be used with ignoreSilentSwitch=obey - using playAndRecord category"
+        )
+      }
+      return .playAndRecord
+    }
+    
+    // Honor silent switch if requested
+    if silentSwitchObey {
+      return .ambient
+    }
+    
+    // Default to playback for most cases
+    return .playback
+  }
+  
+  func determineAudioMixingMode() -> MixAudioMode {
+    let activePlayers = players.allObjects.filter { player in
+      player.isPlaying && player.player.isMuted != true
+    }
+    
+    if activePlayers.isEmpty {
+      return .mixwithothers
+    }
+    
+    let anyPlayerNeedsMixWithOthers = activePlayers.contains { player in
+      player.mixAudioMode == .mixwithothers
+    }
+    
+    let anyPlayerNeedsNotMixWithOthers = activePlayers.contains { player in
+      player.mixAudioMode == .donotmix
+    }
+    
+    let anyPlayerNeedsDucksOthers = activePlayers.contains { player in
+      player.mixAudioMode == .duckothers
+    }
+    
+    let anyPlayerHasAutoMixAudioMode = activePlayers.contains { player in
+      player.mixAudioMode == .auto
+    }
+    
+    if anyPlayerNeedsNotMixWithOthers {
+      return .donotmix
+    }
+    
+    if anyPlayerHasAutoMixAudioMode {
+      return .auto
+    }
+    
+    if anyPlayerNeedsDucksOthers {
+      return .duckothers
+    }
+    
+    return .mixwithothers
+  }
+  
+  
+  // MARK: - Notification Handlers
+  
+  @objc
+  private func handleAudioSessionInterruption(notification: Notification) {
+    guard let userInfo = notification.userInfo,
+          let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+          let type = AVAudioSession.InterruptionType(rawValue: typeValue)
+    else {
+      return
+    }
+
+    let options = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt).map {
+      AVAudioSession.InterruptionOptions(rawValue: $0)
+    }
+
+    runOnMainThread { [weak self] in
+      guard let self else { return }
+
+      switch type {
+      case .began:
+        // The interruption deactivated our session — keep the cache honest.
+        self.isAudioSessionActive = false
+        // Not a system background pause; don't auto-resume after an interruption.
+        for player in self.players.allObjects {
+          player.wasPlayingInBackground = false
+        }
+
+      case .ended:
+        // Interruption ended, check if we should resume audio session
+        if options?.contains(.shouldResume) == true {
+          self.updateAudioSessionConfiguration()
+        }
+
+      @unknown default:
+        break
+      }
+    }
+  }
+  
+  @objc
+  private func handleAudioRouteChange(notification: Notification) {
+    guard let userInfo = notification.userInfo,
+          let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+          let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
+    else {
+      return
+    }
+
+    runOnMainThread { [weak self] in
+      guard let self else { return }
+
+      switch reason {
+      case .oldDeviceUnavailable:
+        // Output device removed (e.g. headphones) — iOS pauses; don't resume onto the speaker.
+        for player in self.players.allObjects {
+          player.wasPlayingInBackground = false
+        }
+        self.updateAudioSessionConfiguration()
+      case .categoryChange, .override, .wakeFromSleep, .newDeviceAvailable:
+        // Reconfigure audio session when route changes
+        self.updateAudioSessionConfiguration()
+      default:
+        break
+      }
+    }
+  }
+  
+  @objc func applicationWillResignActive(notification: Notification) {
+    runOnMainThread { [weak self] in
+      guard let self else { return }
+      // Pause all players when the app is about to become inactive
+      for player in self.players.allObjects {
+        if player.playInBackground || player.playWhenInactive || !player.isPlaying || player.player.isExternalPlaybackActive == true {
+          continue
+        }
+
+        try? player.pause()
+        player.wasAutoPaused = true
+      }
+    }
+  }
+  
+  @objc func applicationDidBecomeActive(notification: Notification) {
+    runOnMainThread { [weak self] in
+      guard let self else { return }
+      // Resume all players when the app becomes active
+      for player in self.players.allObjects {
+        if player.wasAutoPaused {
+          try? player.play()
+          player.wasAutoPaused = false
+        }
+      }
+    }
+  }
+  
+  @objc func applicationDidEnterBackground(notification: Notification) {
+    runOnMainThread { [weak self] in
+      guard let self else { return }
+      // Pause all players when the app enters background
+      for player in self.players.allObjects {
+        if player.playInBackground || player.player.isExternalPlaybackActive == true || !player.isPlaying {
+          player.wasPlayingInBackground = player.playInBackground && player.isPlaying
+          continue
+        }
+
+        try? player.pause()
+        player.wasAutoPaused = true
+      }
+    }
+  }
+
+  @objc func applicationWillEnterForeground(notification: Notification) {
+    runOnMainThread { [weak self] in
+      guard let self else { return }
+      // Resume all players when the app enters foreground
+      for player in self.players.allObjects {
+        if player.wasAutoPaused {
+          try? player.play()
+          player.wasAutoPaused = false
+        } else if player.wasPlayingInBackground && !player.isPlaying {
+          // Was playing when backgrounded but the system paused it — resume.
+          try? player.play()
+        }
+
+        player.wasPlayingInBackground = false
+      }
+
+      // Re-assert the session — it may have been deactivated by the system while backgrounded.
+      self.updateAudioSessionConfiguration()
+    }
+  }
+}

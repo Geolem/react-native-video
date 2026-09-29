@@ -1,20 +1,64 @@
-Thanks for opening a PR!
-Since this is a volunteer project and is very active, anything you can do to reduce the amount of time needed to review and merge your PR is appreciated.
-The following steps will help get your PR merged quickly:
+<!--
+Thanks for opening a pull request!
 
-#### Update the documentation
-If you've added new functionality, update the README.md with an entry for your prop or event.
-The entry should be inserted in alphabetical order.
+To help us review and merge it quickly:
+- Keep the PR focused on a single concern - split unrelated changes into separate PRs.
+- Add or update tests for the change - a unit test and/or a Maestro E2E flow. A bug fix in an
+  area the E2E suite can exercise (playback, seeking, volume, rate, loop, events, errors) should
+  come with a flow that reproduces it. See "Testing your change" in CONTRIBUTING.md.
+- Update the docs (`docs/`) and the README when you change or add public API, props, or events.
+- Update the AI agent skill (`skills/react-native-video/`) the same way when you change how the library is used (API, props, events, behavior).
+- Link the issue this PR addresses with "Fixes #<number>".
+-->
 
-#### Update the changelog
-After you open the PR, update the CHANGELOG.md file with an entry pointing to your PR.
+## Summary
 
-#### Provide an example of how to test the change
-If the PR requires special testing setup provide all the relevant instructions and files. This may include a sample video file or URL, configuration, or setup steps.
+<!-- A clear, concise description of what this PR does. -->
 
-#### Focus the PR on only one area
-Testing multiple features takes longer than isolated changes and if there is a bug in one feature, prevents the other parts of your PR from getting merged until it gets fixed.
-If you're touching multiple different areas that aren't related, break the changes up into multiple PRs.
+## Motivation
 
-#### Describe the changes
-Add a note describing what your PR does. If there is a change to the behavior of the code, explain why it needs to be updated.
+<!-- Why is this change needed? Link the related issue, e.g. "Fixes #1234". -->
+
+## Changes
+
+<!-- A short bullet list of the notable changes. -->
+
+-
+
+## Platforms affected
+
+<!-- Check all that apply. -->
+
+- [ ] Android
+- [ ] iOS
+- [ ] visionOS
+- [ ] tvOS / Android TV
+- [ ] Windows
+- [ ] Web
+
+## Type of change
+
+- [ ] Bug fix (non-breaking change that fixes an issue)
+- [ ] New feature (non-breaking change that adds functionality)
+- [ ] Breaking change (fix or feature that changes existing behavior)
+- [ ] Documentation only
+
+## Test plan
+
+<!--
+How did you verify the change?
+- Automated: which unit tests (`packages/react-native-video/__tests__/`) or Maestro flows (`e2e/flows/`) you added or updated, and what they assert.
+- Manual: steps, a sample source/URL, config, and the expected behavior. Screenshots or a screen recording help a lot.
+- If no automated test fits (e.g. native UI, DRM, PiP, a platform CI does not run), say why.
+-->
+
+## Checklist
+
+- [ ] I read the [contributing guidelines](https://github.com/TheWidlarzGroup/react-native-video/blob/master/CONTRIBUTING.md).
+- [ ] I added or updated tests that cover this change, or explained under "Test plan" why none apply.
+- [ ] For a bug fix the E2E suite can exercise, this PR includes a Maestro flow that fails without the fix, or "Test plan" explains why none does.
+- [ ] `bun run test`, `bun lint` and `bun typecheck` pass locally.
+- [ ] I updated the documentation / README where relevant.
+- [ ] If this changes how the library is used (API, props, events, behavior), I updated the AI agent skill (`skills/react-native-video/`) to match.
+- [ ] This PR is focused on a single concern.
+- [ ] I tested my changes on at least one platform, or described under "Test plan" what CI (which runs both) should show.

@@ -1,0 +1,348 @@
+package com.twg.video.core
+
+import android.os.Build
+import android.util.Log
+import androidx.annotation.MainThread
+import androidx.annotation.OptIn
+import androidx.media3.common.util.UnstableApi
+import com.facebook.react.bridge.LifecycleEventListener
+import com.margelo.nitro.NitroModules
+import com.margelo.nitro.video.HybridVideoPlayer
+import com.margelo.nitro.video.MixAudioMode
+import com.twg.video.core.plugins.PluginsRegistry
+import com.twg.video.core.utils.PictureInPictureUtils
+import com.twg.video.core.utils.Threading.runOnMainThreadSync
+import com.twg.video.view.VideoView
+import java.lang.ref.WeakReference
+
+@OptIn(UnstableApi::class)
+object VideoManager : LifecycleEventListener {
+  private const val TAG = "VideoManager"
+  
+  // nitroId -> weak VideoView
+  private val views = mutableMapOf<Int, WeakReference<VideoView>>()
+  // player -> list of nitroIds of views that are using this player
+  private val players = mutableMapOf<HybridVideoPlayer, MutableList<Int>>()
+
+  // Keep track of players that were paused due to PiP so that they can be resumed later
+  private val playersPausedForPip = mutableSetOf<HybridVideoPlayer>()
+
+  private var currentPipVideoView: WeakReference<VideoView>? = null
+
+  var audioFocusManager = AudioFocusManager()
+
+  private var lastPlayedNitroId: Int? = null
+
+  @MainThread
+  private fun playersSnapshot(): List<HybridVideoPlayer> =
+    players.keys.toList()
+
+  @MainThread
+  private fun viewsSnapshot(): List<WeakReference<VideoView>> =
+    views.values.toList()
+
+  init {
+    NitroModules.applicationContext?.apply {
+      addLifecycleEventListener(this@VideoManager)
+    }
+  }
+
+  fun requestPictureInPicture(videoView: VideoView): Boolean {
+    Log.d(TAG, "PiP requested for video nitroId: ${videoView.nitroId}")
+    
+    if (videoView.isInPictureInPicture) {
+      Log.d(TAG, "Video nitroId: ${videoView.nitroId} is already in PiP")
+      return true
+    }
+    
+    // Exit PiP from current video if there is one
+    currentPipVideoView?.get()?.let { currentPipVideo ->
+      if (currentPipVideo != videoView && currentPipVideo.isInPictureInPicture) {
+        Log.d(TAG, "Forcing exit PiP for video nitroId: ${currentPipVideo.nitroId} to make room for nitroId: ${videoView.nitroId}")
+        currentPipVideo.forceExitPictureInPicture()
+      }
+    }
+    
+    // Ensure the player that belongs to this view is attached back to this view
+    videoView.hybridPlayer?.movePlayerToVideoView(videoView)
+    
+    // Pause every other player that might be playing in the background so that only the PiP video plays
+    pauseOtherPlayers(videoView)
+    
+    // Set this video as the designated PiP video BEFORE entering PiP mode
+    // This ensures the PictureInPictureHelperFragment callbacks know which video should respond
+    currentPipVideoView = WeakReference(videoView)
+    Log.d(TAG, "Designated video nitroId: ${videoView.nitroId} as the PiP video")
+    
+    val success = videoView.internalEnterPictureInPicture()
+    Log.d(TAG, "PiP enter result for video nitroId: ${videoView.nitroId} = $success")
+    
+    if (!success) {
+      // If we failed to enter PiP, resume any players we just paused
+      resumePlayersPausedForPip()
+      currentPipVideoView = null
+      Log.w(TAG, "Failed to enter PiP, clearing designated PiP video")
+    }
+    
+    return success
+  }
+  
+  fun notifyPictureInPictureExited(videoView: VideoView) {
+    Log.d(TAG, "PiP exit notification for video nitroId: ${videoView.nitroId}")
+    currentPipVideoView?.get()?.let { currentPipVideo ->
+      if (currentPipVideo == videoView) {
+        Log.d(TAG, "Clearing PiP reference for video nitroId: ${videoView.nitroId}")
+        currentPipVideoView = null
+        // Resume any players that were paused when PiP was entered
+        resumePlayersPausedForPip()
+      }
+    }
+  }
+  
+  fun getCurrentPictureInPictureVideo(): VideoView? {
+    return currentPipVideoView?.get()
+  }
+  
+  fun setCurrentPictureInPictureVideo(videoView: VideoView) {
+    Log.d(TAG, "Setting current PiP video to nitroId: ${videoView.nitroId}")
+    currentPipVideoView = WeakReference(videoView)
+  }
+  
+  fun isAnyVideoInPictureInPicture(): Boolean {
+    return currentPipVideoView?.get()?.isInPictureInPicture == true
+  }
+  
+  fun forceExitAllPictureInPicture() {
+    currentPipVideoView?.get()?.let { currentPipVideo ->
+      if (currentPipVideo.isInPictureInPicture) {
+        currentPipVideo.forceExitPictureInPicture()
+      }
+    }
+    currentPipVideoView = null
+  }
+
+  fun maybePassPlayerToView(player: HybridVideoPlayer) {
+    runOnMainThreadSync {
+      val nitroIds = players[player]?.toList() ?: return@runOnMainThreadSync
+      val latestView = nitroIds.mapNotNull { views[it]?.get() }.lastOrNull()
+        ?: return@runOnMainThreadSync
+      player.movePlayerToVideoView(latestView)
+    }
+  }
+
+  fun registerView(view: VideoView) {
+    runOnMainThreadSync {
+      views[view.nitroId] = WeakReference(view)
+      PluginsRegistry.shared.notifyVideoViewCreated(WeakReference(view))
+    }
+  }
+
+  fun unregisterView(view: VideoView) {
+    runOnMainThreadSync {
+      view.hybridPlayer?.let {
+        removeViewFromPlayer(view, it)
+      }
+
+      if (currentPipVideoView?.get() == view) {
+        currentPipVideoView = null
+      }
+
+      views.remove(view.nitroId)
+      PluginsRegistry.shared.notifyVideoViewDestroyed(WeakReference(view))
+    }
+  }
+
+  fun addViewToPlayer(view: VideoView, player: HybridVideoPlayer) {
+    runOnMainThreadSync {
+      if (player.isReleaseStarted) {
+        return@runOnMainThreadSync
+      }
+
+      val nitroIds = players.getOrPut(player) { mutableListOf() }
+      if (!nitroIds.contains(view.nitroId)) {
+        nitroIds.add(view.nitroId)
+      }
+    }
+  }
+
+  fun removeViewFromPlayer(view: VideoView, player: HybridVideoPlayer) {
+    runOnMainThreadSync {
+      val nitroIds = players[player] ?: return@runOnMainThreadSync
+      nitroIds.remove(view.nitroId)
+      if (nitroIds.isNotEmpty()) {
+        maybePassPlayerToView(player)
+      }
+    }
+  }
+
+  fun registerPlayer(player: HybridVideoPlayer) {
+    runOnMainThreadSync {
+      if (player.isReleaseStarted || players.containsKey(player)) {
+        return@runOnMainThreadSync
+      }
+      players[player] = mutableListOf()
+      audioFocusManager.registerPlayer(player)
+      PluginsRegistry.shared.notifyPlayerCreated(WeakReference(player))
+    }
+  }
+
+  fun unregisterPlayer(player: HybridVideoPlayer) {
+    runOnMainThreadSync {
+      val nitroIds = players.remove(player) ?: return@runOnMainThreadSync
+      audioFocusManager.unregisterPlayer(player)
+      PluginsRegistry.shared.notifyPlayerDestroyed(WeakReference(player))
+      nitroIds.mapNotNull { views[it]?.get() }.forEach { view ->
+        view.hybridPlayer = null
+      }
+    }
+  }
+
+  fun getPlayerByNitroId(nitroId: Int): HybridVideoPlayer? {
+    return runOnMainThreadSync {
+      players.entries.find { (_, nitroIds) -> nitroIds.contains(nitroId) }?.key
+    }
+  }
+
+  fun updateVideoViewNitroId(oldNitroId: Int, newNitroId: Int, view: VideoView) {
+    runOnMainThreadSync {
+      // Remove old mapping
+      if (oldNitroId != -1) {
+        views.remove(oldNitroId)
+
+        // Update player mappings
+        players.values.forEach { nitroIds ->
+          if (nitroIds.remove(oldNitroId)) {
+            nitroIds.add(newNitroId)
+          }
+        }
+      }
+
+      // Add new mapping
+      views[newNitroId] = WeakReference(view)
+    }
+  }
+
+  fun getVideoViewWeakReferenceByNitroId(nitroId: Int): WeakReference<VideoView>? {
+    return runOnMainThreadSync { views[nitroId] }
+  }
+
+  // Keep the activity's auto-enter-PiP flag synced to the last-played video (the PiP
+  // authority — per-activity, only one video drives auto-enter). setPictureInPictureParams
+  // merges, so always set params explicitly: disable auto-enter when there is no last-played
+  // video or it shouldn't drive PiP, otherwise a flag an earlier view enabled would linger.
+  // (Gating on playWhenReady happens in createPictureInPictureParams.)
+  fun refreshPictureInPictureParams() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+      return
+    }
+
+    val view = getLastPlayedVideoView()
+    val params = when {
+      view == null || !view.pictureInPictureEnabled -> PictureInPictureUtils.createDisabledPictureInPictureParams()
+      else -> PictureInPictureUtils.createPictureInPictureParams(view)
+    }
+
+    PictureInPictureUtils.safeSetPictureInPictureParams(params)
+  }
+
+  // ------------ Lifecycle Handler ------------
+  private fun onAppEnterForeground() {
+    playersSnapshot().forEach { player ->
+      if (player.wasAutoPaused) {
+        player.play()
+        // Clear so a later manual pause isn't wrongly auto-resumed on the next foreground.
+        player.wasAutoPaused = false
+      }
+    }
+  }
+
+  private fun onAppEnterBackground() {
+    // Keep the PiP video playing, but still auto-pause every other non-background player. If no
+    // PiP player is designated yet (auto-enter can race it), pause nothing rather than risk it.
+    val activity = try { NitroModules.applicationContext?.currentActivity } catch (_: Exception) { null }
+    val inPip = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && activity?.isInPictureInPictureMode == true
+    val pipPlayer = if (inPip) {
+      getCurrentPictureInPictureVideo()?.hybridPlayer ?: return
+    } else {
+      null
+    }
+
+    playersSnapshot().forEach { player ->
+      if (player == pipPlayer) {
+        return@forEach
+      }
+
+      if (!player.playInBackground && player.isPlaying) {
+        player.wasAutoPaused = true
+        player.pause()
+      }
+    }
+  }
+
+  override fun onHostResume() {
+    onAppEnterForeground()
+  }
+
+  override fun onHostPause() {
+    onAppEnterBackground()
+  }
+
+  override fun onHostDestroy() {
+    forceExitAllPictureInPicture()
+  }
+
+  fun pauseOtherPlayers(pipVideoView: VideoView) {
+    val pipPlayer = pipVideoView.hybridPlayer
+    playersPausedForPip.clear()
+
+    playersSnapshot().forEach { player ->
+      // Skip the player that is used for the PiP view
+      if (player == pipPlayer) return@forEach
+
+      // Pause only if it is currently playing
+      if (player.isPlaying && player.mixAudioMode != MixAudioMode.MIXWITHOTHERS) {
+        player.pause()
+        playersPausedForPip.add(player)
+        val ids = players[player]?.toList()
+        Log.v(TAG, "Paused player for PiP, nitroIds: $ids")
+      }
+    }
+  }
+
+  private fun resumePlayersPausedForPip() {
+    val paused = playersPausedForPip.toList()
+    playersPausedForPip.clear()
+
+    paused.forEach { player ->
+      // Ensure the player is attached to the latest visible VideoView before resuming
+      maybePassPlayerToView(player)
+
+      if (!player.isPlaying) {
+        player.play()
+        val ids = players[player]?.toList()
+        Log.v(TAG, "Resumed player after PiP exit, nitroIds: $ids")
+      }
+    }
+  }
+
+  fun getAnyPlayingVideoView(): VideoView? {
+    return runOnMainThreadSync {
+      viewsSnapshot().firstOrNull { ref ->
+        ref.get()?.hybridPlayer?.isPlaying == true
+      }?.get()
+    }
+  }
+
+  fun setLastPlayedPlayer(player: HybridVideoPlayer) {
+    runOnMainThreadSync {
+      val nitroIds = players[player] ?: return@runOnMainThreadSync
+      if (nitroIds.isNotEmpty()) {
+        lastPlayedNitroId = nitroIds.last()
+      }
+    }
+  }
+
+  fun getLastPlayedVideoView(): VideoView? {
+    return runOnMainThreadSync { lastPlayedNitroId?.let { views[it]?.get() } }
+  }
+}
